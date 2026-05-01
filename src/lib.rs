@@ -53,6 +53,32 @@ pub struct OtlpConfig {
     pub headers: HashMap<String, String>,
 }
 
+/// Format used by the stdout logger (the `tracing_subscriber::fmt` layer).
+/// The stdout logger is **independent** of OTLP log export ([`Builder::with_logs`]):
+/// you can have stdout-only logs (no OTLP), OTLP-only logs (no stdout, set
+/// [`LogFormat::Off`]), or both at the same time. Logs sent through OTLP to
+/// Loki/cloud are always structured (protobuf), regardless of this setting.
+#[allow(dead_code)] // All variants are part of the public API.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum LogFormat {
+    /// Multi-line, ANSI-colored, human-readable. Best for local development.
+    /// One event spans several lines (target, span context, fields, location).
+    #[default]
+    Pretty,
+    /// One line per event, key=value fields, ANSI colors when stdout is a TTY.
+    /// Middle ground between Pretty and Json — readable but compact enough
+    /// to fit a terminal width.
+    Compact,
+    /// Single-line JSON per event. Use this when stdout is scraped by a log
+    /// shipper (Promtail, Vector, Fluentd, k8s log driver) — the only format
+    /// that survives downstream parsing intact.
+    Json,
+    /// Disable the stdout logger entirely. Use this when all logs go to OTLP
+    /// (via [`Builder::with_logs`]) and stdout would just be noise — e.g. in
+    /// containers where Loki ingests via OTel and stdout is unwatched.
+    Off,
+}
+
 /// Config for the Pyroscope CPU profiling agent. Provide it via
 /// `Builder::with_profiling(...)` to enable profiling; omit to disable it.
 ///
@@ -80,6 +106,7 @@ pub struct Builder {
     deployment_environment: String,
     host_name: String,
     log_filter: String,
+    log_format: LogFormat,
     logs: Option<OtlpConfig>,
     traces: Option<(OtlpConfig, f64)>,
     metrics: Option<(OtlpConfig, Duration)>,
@@ -97,6 +124,7 @@ impl Builder {
             deployment_environment: "local".to_string(),
             host_name: "unknown".to_string(),
             log_filter: "info".to_string(),
+            log_format: LogFormat::default(),
             logs: None,
             traces: None,
             metrics: None,
@@ -141,6 +169,15 @@ impl Builder {
     /// Example: `"info,my_app=debug,pyroscope=warn,Pyroscope=warn"`.
     pub fn log_filter(mut self, v: impl Into<String>) -> Self {
         self.log_filter = v.into();
+        self
+    }
+
+    /// Sets the stdout log format. Default [`LogFormat::Pretty`] for local
+    /// development. Use [`LogFormat::Json`] when stdout is scraped by a log
+    /// shipper (Promtail, Vector, k8s log driver), or [`LogFormat::Compact`]
+    /// for a one-line readable middle ground.
+    pub fn log_format(mut self, format: LogFormat) -> Self {
+        self.log_format = format;
         self
     }
 
@@ -312,9 +349,19 @@ impl Builder {
         // process doesn't panic on a duplicate set_global_default. In production
         // init() is called once at startup — if the subscriber is already set,
         // someone is setting up telemetry twice (a bug), but we tolerate it silently.
+        //
+        // Each format method on fmt::layer() returns a different concrete type;
+        // .boxed() on the Layer trait erases them to a uniform Box<dyn Layer>.
+        use tracing_subscriber::Layer;
+        let fmt_layer = match self.log_format {
+            LogFormat::Pretty => Some(tracing_subscriber::fmt::layer().pretty().boxed()),
+            LogFormat::Compact => Some(tracing_subscriber::fmt::layer().compact().boxed()),
+            LogFormat::Json => Some(tracing_subscriber::fmt::layer().json().boxed()),
+            LogFormat::Off => None,
+        };
         let _ = tracing_subscriber::registry()
             .with(EnvFilter::new(&self.log_filter))
-            .with(tracing_subscriber::fmt::layer().json())
+            .with(fmt_layer)
             .with(otel_trace_layer) // tracing::Span -> OTel Span (must come before the log layer)
             .with(otel_log_layer) // tracing::Event -> OTel LogRecord (with trace_id from the active span)
             .try_init();
