@@ -241,7 +241,18 @@ Builder::new()
 ## HTTP middleware (axum)
 
 This crate handles SDK setup. For HTTP server instrumentation you'll typically
-add `axum-otel-metrics` and `tower-http`'s `TraceLayer` on top:
+combine two middlewares on top:
+
+- `axum-otel-metrics` — emits the OpenTelemetry HTTP server metrics
+  (`http.server.request.duration` histogram, `http.server.{request,response}.body.size`,
+  `http.server.active_requests`) using the global `MeterProvider` that
+  `Builder::init()` set up. Result: RED dashboard out of the box.
+- `tower-http`'s `TraceLayer` — creates a root span per request and emits an
+  event when the response is ready. Trace context (trace_id / span_id) is
+  active for every `tracing::info!` / `error!` inside the handler, so logs are
+  automatically correlated with the trace.
+
+### Cargo.toml
 
 ```toml
 [dependencies]
@@ -249,44 +260,156 @@ rust_telemetry = { git = "https://github.com/zygmunt-pawel/rust_telemetry" }
 axum = "0.8"
 axum-otel-metrics = "0.13"
 tower-http = { version = "0.6", features = ["trace"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
 ```
 
+### Full setup
+
 ```rust
-use axum::{routing::get, Router};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use axum::{
+    extract::{ConnectInfo, MatchedPath, Request},
+    http::header,
+    routing::get,
+    Router,
+};
 use axum_otel_metrics::HttpMetricsLayerBuilder;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnFailure, TraceLayer};
+use tracing::{Level, Span};
+
+use rust_telemetry::{Builder, OtlpConfig, ProfilingConfig, Protocol};
 
 #[tokio::main]
 async fn main() {
-    let _guard = rust_telemetry::Builder::new()
+    // 1) Initialize telemetry (logs + traces + metrics + profiles).
+    let alloy = OtlpConfig {
+        endpoint: "http://localhost:4317".to_string(),
+        protocol: Protocol::Grpc,
+        headers: HashMap::new(),
+    };
+    let _guard = Builder::new()
         .service_name("my-api")
-        .with_logs(/*...*/)
-        .with_traces(/*...*/, 0.1)
-        .with_metrics(/*...*/, Duration::from_secs(15))
+        .service_version(env!("CARGO_PKG_VERSION"))
+        .deployment_environment("production")
+        .host_name("api-01")
+        .log_filter("info,my_api=debug,pyroscope=warn,Pyroscope=warn")
+        .with_logs(alloy.clone())
+        .with_traces(alloy.clone(), 0.1)
+        .with_metrics(alloy.clone(), Duration::from_secs(15))
+        .with_profiling(ProfilingConfig {
+            endpoint: "http://localhost:4040".to_string(),
+            sample_rate_hz: 100,
+            auth_token: None,
+            basic_auth: None,
+        })
         .init();
 
-    // OTel HTTP metrics (RED: rate, errors, duration) — uses the global
-    // MeterProvider which `init()` set up.
+    // 2) Build the OTel HTTP metrics layer. It uses the global MeterProvider
+    //    which Builder::init() registered.
     let metrics_layer = HttpMetricsLayerBuilder::new().build();
 
+    // 3) Build the tower-http TraceLayer. The default span is minimal — we
+    //    customize it to also carry route, client_ip and user_agent attributes
+    //    (useful for abuse detection and per-route traces in Tempo) and to
+    //    record status code on response.
+    let trace_layer = TraceLayer::new_for_http()
+        .make_span_with(|req: &Request<_>| {
+            let route = req
+                .extensions()
+                .get::<MatchedPath>()
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| req.uri().path().to_string());
+            let client_ip = req
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|ci| ci.0.ip().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let user_agent = req
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string();
+            tracing::info_span!(
+                "http_request",
+                method = %req.method(),
+                uri = %req.uri().path(),
+                route = %route,
+                client_ip = %client_ip,
+                user_agent = %user_agent,
+                status = tracing::field::Empty,
+            )
+        })
+        .on_response(
+            |response: &axum::http::Response<_>, _latency: Duration, span: &Span| {
+                // The full HTTP context (status, route, client_ip, ...) lives
+                // on the span. Tempo derives duration automatically from
+                // (end_time - start_time), so we don't duplicate it on the event.
+                let status = response.status().as_u16();
+                span.record("status", status);
+                tracing::info!("finished processing request");
+            },
+        )
+        .on_failure(DefaultOnFailure::new().level(Level::ERROR));
+
+    // 4) Wire both into the router. Order matters:
+    //    - route_layer(metrics_layer) — runs AFTER axum's router populates
+    //      MatchedPath in request extensions, so metrics get a non-empty
+    //      `http.route` label. Plain .layer() would leave http.route="".
+    //    - layer(trace_layer)         — outer wrapper. Span is created first,
+    //      becomes active in Context, so any handler-internal tracing event
+    //      inherits trace_id/span_id automatically.
     let app = Router::new()
         .route("/", get(|| async { "hello" }))
-        // route_layer (not layer) so metrics see MatchedPath populated by
-        // axum's router. With plain .layer(), http.route would be empty.
         .route_layer(metrics_layer)
-        // tower-http TraceLayer — creates a per-request span, propagating
-        // trace_id to every event/log inside the handler.
-        .layer(TraceLayer::new_for_http());
+        .layer(trace_layer);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // 5) `into_make_service_with_connect_info::<SocketAddr>()` is required for
+    //    the ConnectInfo<SocketAddr> extension to be present — without it,
+    //    client_ip in make_span_with is always "unknown".
+    let addr: SocketAddr = "0.0.0.0:3000".parse().expect("invalid bind address");
+    tracing::info!(%addr, "starting server");
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 ```
 
-You'll get:
+### What you get
 
-- `http.server.request.duration` histogram (with `http.route`, `http.request.method`, `http.response.status_code` attributes) → Prometheus-compatible RED dashboard.
-- A root span per request with `trace_id`/`span_id` propagated to every `tracing::info!` / `error!` / etc. inside the handler.
+- **RED metrics:** `http_server_request_duration_count` / `_bucket` / `_sum`
+  with `http_route`, `http_request_method`, `http_response_status_code` labels.
+  Plug straight into a Grafana RED dashboard.
+- **Per-request span:** `http_request` with attributes `method`, `uri`,
+  `route`, `client_ip`, `user_agent`, `status`. Visible in Tempo as the root
+  of the request's trace tree.
+- **Log↔trace correlation:** every `tracing::info!`/`error!`/etc. inside the
+  handler inherits `trace_id` and `span_id` from the active span. In Loki the
+  log carries those as structured metadata; clicking `trace_id` jumps to Tempo.
+- **Automatic error severity:** `on_failure(DefaultOnFailure::new().level(ERROR))`
+  emits an ERROR event whenever the handler panics or returns a 5xx, so error
+  rate counters and alerts work without manual instrumentation.
+
+### Notes on naming conventions
+
+OpenTelemetry HTTP semantic conventions use dotted attribute names
+(`http.server.request.duration`, `http.route`). Backends like Mimir and Loki
+convert these to underscores when exposing PromQL/LogQL labels:
+- `http.server.request.duration` → `http_server_request_duration` (no
+  `_seconds` suffix in Mimir 2.13 — it doesn't auto-append unit suffixes
+  even when the SDK sets `with_unit("s")`)
+- `service.name` → `job` (Prometheus convention) **not** `service_name`
+
+Account for this when writing PromQL. For Tempo (which keeps span attributes
+in their native dotted form), use `span.http.route` and `resource.service.name`.
 
 ## Notes & limitations
 
