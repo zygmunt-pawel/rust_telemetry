@@ -1,0 +1,32 @@
+[package]
+name = "rust_telemetry"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+description = "Drop-in OTel SDK + Pyroscope setup for Rust apps. Builder API for logs, traces, metrics, and CPU profiling — all four pillars in one place."
+license = "MIT"
+repository = "https://github.com/zygmunt-pawel/rust_telemetry"
+keywords = ["telemetry", "observability", "opentelemetry", "pyroscope", "tracing"]
+categories = ["development-tools::debugging"]
+
+[dependencies]
+opentelemetry = "=0.31.0"
+opentelemetry_sdk = { version = "=0.31.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "=0.31.1", features = [
+    "grpc-tonic",
+    "http-proto",
+    "reqwest-blocking-client",
+    "logs",
+    "trace",
+    "metrics",
+] }
+opentelemetry-appender-tracing = "=0.31.1"
+tracing = "=0.1.44"
+tracing-opentelemetry = "=0.32.1"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "json", "fmt"] }
+tonic = "=0.14.5"
+pyroscope = "=0.5.8"
+pyroscope_pprofrs = "=0.2.10"
+
+[dev-dependencies]
+tokio = { version = "=1.52.1", features = ["full"] }

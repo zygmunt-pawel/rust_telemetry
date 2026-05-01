@@ -1,0 +1,45 @@
+name: Update MSRV
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check for new Rust version
+        id: check
+        run: |
+          CURRENT=$(grep '^rust-version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          LATEST=$(rustc --version | awk '{print $2}')
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          if [ "$CURRENT" != "$LATEST" ]; then
+            echo "outdated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update MSRV
+        if: steps.check.outputs.outdated == 'true'
+        run: |
+          LATEST=${{ steps.check.outputs.latest }}
+          sed -i "s/^rust-version = .*/rust-version = \"$LATEST\"/" Cargo.toml
+
+      - name: Create PR
+        if: steps.check.outputs.outdated == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: update-msrv-${{ steps.check.outputs.latest }}
+          title: "deps: bump MSRV to ${{ steps.check.outputs.latest }}"
+          body: |
+            Bumps `rust-version` in `Cargo.toml` from ${{ steps.check.outputs.current }} to ${{ steps.check.outputs.latest }}.
+          commit-message: "deps: bump MSRV to ${{ steps.check.outputs.latest }}"
