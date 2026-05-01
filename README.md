@@ -39,7 +39,7 @@ tracing = "0.1"
 `main.rs`:
 
 ```rust
-use rust_telemetry::{Builder, OtlpConfig, Protocol, ProfilingConfig};
+use rust_telemetry::{Builder, LogFormat, OtlpConfig, Protocol, ProfilingConfig};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -88,6 +88,10 @@ Builder::new()
     .host_name("instance-01")          // default "unknown"
     .log_filter("info,my_app=debug")   // default "info"
 
+    // Stdout log format (default Pretty for local dev, Json for log shippers,
+    // Off to silence stdout entirely):
+    .log_format(LogFormat::Pretty)
+
     // Pillars (each is optional; type system enforces full config when enabled):
     .with_logs(otlp_config)
     .with_traces(otlp_config, sample_rate)            // 0.0 .. 1.0
@@ -101,6 +105,32 @@ Builder::new()
 The returned `Guard` is an RAII handle: hold it in `main` until the process
 exits. On drop it flushes Pyroscope, then logs/traces/metrics — in that order.
 
+### Two independent log paths
+
+The crate exposes **two independent paths** for log events from `tracing::info!`/etc:
+
+```text
+tracing::info!("hello", greeting="world")
+     │
+     ├─→ fmt::layer  (controlled by .log_format)  → stdout / docker logs / journalctl
+     │
+     └─→ OTLP bridge (enabled by .with_logs)      → alloy / collector → Loki / cloud
+                                                    (always structured protobuf)
+```
+
+You can have either path, both, or neither:
+
+| Want | `.log_format(...)` | `.with_logs(...)` |
+|---|---|---|
+| Pretty stdout for local dev, no backend | `Pretty` (default) | omit |
+| OTLP only (logs go to Loki, stdout silent) | `Off` | set |
+| Both — pretty terminal AND Loki | `Pretty` | set |
+| JSON stdout for log shipper + OTLP backup | `Json` | set |
+| Compact one-line stdout, no backend | `Compact` | omit |
+
+The format only changes what your terminal shows. Loki gets the same
+structured `LogRecord` regardless of the format you pick.
+
 ## Configuration shapes
 
 ```rust
@@ -113,6 +143,13 @@ pub struct OtlpConfig {
 pub enum Protocol {
     Grpc,    // OTLP/gRPC — default for collectors and Tempo
     Http,    // OTLP/HTTP — required for Loki/Mimir cloud
+}
+
+pub enum LogFormat {
+    Pretty,  // multi-line ANSI, human-readable        ← default
+    Compact, // one-line key=value, terminal-friendly
+    Json,    // single-line JSON for log shippers
+    Off,     // disable stdout entirely
 }
 
 pub struct ProfilingConfig {
@@ -222,7 +259,7 @@ Builder::new()
     .init();
 ```
 
-### 4. Logs only
+### 4. Logs only (with backend)
 
 Some workloads (cron jobs, scripts, libraries) only want structured logging.
 Skip the rest.
@@ -236,6 +273,48 @@ Builder::new()
         headers: HashMap::new(),
     })
     .init();
+```
+
+### 5. Stdout only — no backends, just pretty terminal logs
+
+Smallest possible setup. No collector, no Loki, no Tempo, no metrics, no
+profiling. `tracing::info!` etc. just go to stdout in human-readable form.
+Useful for CLI tools, scripts, or while you're still standing up the
+observability infrastructure.
+
+```rust
+let _guard = Builder::new()
+    .service_name("my-app")
+    .init();    // no with_*() at all
+
+tracing::info!("hello, world!");
+// → stdout (pretty, multi-line ANSI)
+```
+
+Switch to one-line output if you want compact:
+
+```rust
+let _guard = Builder::new()
+    .service_name("my-app")
+    .log_format(LogFormat::Compact)
+    .init();
+```
+
+### 6. OTLP only — silence stdout entirely
+
+In containers where logs are scraped via OTLP and stdout is just noise:
+
+```rust
+Builder::new()
+    .service_name("my-app")
+    .log_format(LogFormat::Off)
+    .with_logs(OtlpConfig {
+        endpoint: "http://localhost:4317".to_string(),
+        protocol: Protocol::Grpc,
+        headers: HashMap::new(),
+    })
+    .init();
+// nothing prints to stdout; everything goes through OTLP to Loki
 ```
 
 ## HTTP middleware (axum)
